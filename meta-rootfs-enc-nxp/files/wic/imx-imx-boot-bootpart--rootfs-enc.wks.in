@@ -1,0 +1,20 @@
+#
+# meta-rootfs-enc-nxp/files/wic/imx-imx-boot-bootpart--rootfs-enc.wks.in
+#
+# Disk layout for i.MX8/9
+#
+# Purpose:
+#  - Generate the rootfs as a ext4 filesystem on a file, so we can hash
+#    it for doing the integrity check after the encryption on the first boot.
+#  - Allow resizing the boot partition (currently kept to 256 MiB)
+#
+# Note: based on meta-freescale/wic/imx-imx-boot-bootpart.wks.in
+#
+# Copyright (c) 1983-2026 Advantech Co., Ltd. All rights reserved.
+#
+
+part u-boot --source rawcopy --sourceparams="file=imx-boot.tagged" --ondisk mmcblk --no-table --align ${IMX_BOOT_SEEK}
+part /boot --source bootimg-partition --ondisk mmcblk --fstype=vfat --label boot --active --align ${PREPART_SIZE_KIB} --fixed-size ${IMX_BOOTP_SIZE_MIB}
+part / --source rawcopy --sourceparams="file=${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.${IMAGE_ROOTFS_FSTYPE}" --ondisk mmcblk --align 8192
+
+bootloader --ptable msdos

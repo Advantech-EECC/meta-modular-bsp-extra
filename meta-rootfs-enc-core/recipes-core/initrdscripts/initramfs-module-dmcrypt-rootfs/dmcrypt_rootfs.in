@@ -1,0 +1,737 @@
+#!/bin/sh
+#
+# __DMR_INIT_NUM__-dmcrypt_rootfs
+#
+# Root filesystem encryption
+#
+# Cases:
+# - Linux kernel trusted key abstraction (generic, for any ARM system
+#   with OP-TEE support enabled)
+# - CAAM (e.g. HABv4+CAAM: iMX8MP, AHAB+CAAM: iMX8QXP): for NXP systems
+#   having the CAAM module configured, but not wanting to use the above case.
+#
+# Copyright (c) 1983-2026 Advantech Co., Ltd. All rights reserved.
+#
+
+ROOT_DEV=$bootparam_root
+BOOT_DEV=$bootparam_boot
+DMR_DEV_TIMEOUT_S=60
+TMPFS=/run
+BOOT_MNT=/mnt/boot
+BOOT_DEBUG_FLAG=$BOOT_MNT/debug
+DMR_KRM=@u           # root-user keyring (@u)
+KEY_ID=rootfs-enc
+KEY_RAW_SIZE=32
+ROOT_MAP_DEV=/dev/mapper/$KEY_ID
+ENC_INCOMPLETE_FLAG=$BOOT_MNT/enc_incomplete
+FACTORY_SIG_FILE_SUFFIX="__FACTORY_SIG_FILE_SUFFIX__"
+FACTORY_ROOTFS_SHA256_FILE="$BOOT_MNT/__FACTORY_ROOTFS_SHA256_FILE__"
+FACTORY_ROOTFS_SHA256_SIG_FILE=$FACTORY_ROOTFS_SHA256_FILE$FACTORY_SIG_FILE_SUFFIX
+FACTORY_PUB_KEY_FILE="__INITRAMFS_FACTORY_DIR__/__FACTORY_VALIDATION_PUB_FILE__"
+FS_TYPE=__IMAGE_ROOTFS_FSTYPE__
+DD_BS=4M
+DM_TABLE_SECTOR_SIZE=__DM_TABLE_SECTOR_SIZE__
+ENC_CTX=__ROOTFS_ENC_CONTEXT__
+TK_BACKEND=__TK_BACKEND__
+OS_IMAGE=__OS_IMAGE__
+PREPART_SIZE_KIB=__PREPART_SIZE_KIB__
+FIRST_PART_512B_SECTOR=$((PREPART_SIZE_KIB * 2))
+PREPART_512B_S0=$((FIRST_PART_512B_SECTOR - 1))
+PREPART_512B_S1=$((FIRST_PART_512B_SECTOR - 2))
+ROOT_DEV_SECTORS=0
+ROOT_DEV_SECTOR_SIZE=0
+DMR_NR_FACTORY=" - Non recoverable - Action: BOARD REFLASH (!)"
+DMR_NR_RMA=" - Non recoverable - Action: BOARD RMA (!)"
+DMR_NR_MSG=$DMR_NR_RMA
+
+CAAM_CIPHER="capi:tk(cbc(aes))-plain64"
+ELE_TEE_CIPHER="capi:cbc-aes-tee-plain64"
+PAES_CIPHER="capi:cbc(paes)-plain64"
+
+# Entry points
+
+dmcrypt_rootfs_enabled()
+{
+	DMR_TS_BEGIN=$(_dmr_ts)
+
+	_dmr_debug "dmcrypt_rootfs_enabled"
+
+	return 0
+}
+
+dmcrypt_rootfs_run()
+{
+	_dmr_debug "dmcrypt_rootfs_run"
+
+	_dmr_prepare_devices
+	_dmr_check_and_map
+	_dmr_encrypted_boot
+}
+
+# Auxiliary functions
+
+_dmr_pfx() { echo "[$(_dmr_elapsed)][dmr]" ; }
+_dmr_msg() { sync ; msg "$(_dmr_pfx) $@" ; sync ; }
+_dmr_warning() { sync ; msg "$(_dmr_pfx)[W] $@" ; sync ; }
+_dmr_info() { sync ; info "$(_dmr_pfx)[I] $@" ; sync ; }
+_dmr_debug() { sync ; debug "$(_dmr_pfx)[D] $@" ; sync ; }
+_dmr_run() { (sync ; debug "$(_dmr_pfx) [R] $@" ; sync) >/dev/null ; "$@" ; }
+_dmr_debug_flag() { [ -e "$BOOT_DEBUG_FLAG" ] ; }
+_dmr_slen() { echo -n "$1" | wc -m ; }
+_dmr_repeat() { printf "%*s\n" "$2" '' | tr ' ' "$1" ; }
+_dmr_ts() { awk '{ printf "%d\n", $1 * 1000 }' /proc/uptime ; }
+_dmr_ts_diff() { echo $(($1 - $2)) ; }
+_dmr_ts_fmt() { printf "%i.%i" $((($1 + 0) / 1000)) $((($1 + 0) % 1000)) ; }
+_dmr_elapsed() { _dmr_ts_fmt $(_dmr_ts_diff $(_dmr_ts) $DMR_TS_BEGIN) ; }
+_dmr_empty_dir() { ! test -e "$1/"* 2>/dev/null ; }
+
+_dmr_poweroff() {
+	_dmr_cleanup
+
+	sync
+
+	echo 1 > /proc/sys/kernel/sysrq
+	echo o > /proc/sysrq-trigger
+
+	while true ; do sleep 3600 ; dm_msg "poweroff failure (!)" ; done
+}
+
+_dmr_banner() {
+	sln=$(_dmr_repeat "-" $(($(_dmr_slen "$1") + 6)))
+	for dbi in $sln ">  $1  <" $sln ; do sync ; msg "$dbi" ; sync ; done
+}
+
+_dmr_fatal() {
+	_dmr_banner " FATAL ERROR: $@"
+
+	_dmr_poweroff
+}
+
+_dmr_cleanup()
+{
+	_dmr_debug "_dmr_cleanup"
+
+	_dmr_run umount "$BOOT_MNT"
+}
+
+_dmr_poll_block_device()
+{
+	_dmr_debug "_dmr_poll_block_device ($1)"
+
+	dmr_cnt_ms=0
+	dmr_dev_found=0
+	dmr_tout_ms=$((DMR_DEV_TIMEOUT_S * 1000))
+	dmr_step_ms=10
+	sleep_s=$((dmr_step_ms / 1000))
+	sleep_ms=$(printf "%03u" $((dmr_step_ms % 1000)))
+
+	while [ "$dmr_cnt_ms" -lt "$dmr_tout_ms" ] ; do
+		if [ -b "$1" ] ; then
+			dmr_dev_found=1
+			break
+		fi
+		sleep $sleep_s.$sleep_ms
+		dmr_cnt_ms=$((dmr_cnt_ms + dmr_step_ms))
+	done
+
+	[ "$dmr_dev_found" = 1 ] ||
+		_dmr_fatal "$1: device not found after $DMR_DEV_TIMEOUT_S s"
+
+	_dmr_debug "$1 available ($dmr_cnt_ms ms)"
+}
+
+# Primary functions (called from dmcrypt_rootfs_run())
+
+_dmr_prepare_devices()
+{
+	_dmr_debug "_dmr_prepare_devices"
+	_dmr_debug "ROOT_DEV='$ROOT_DEV' BOOT_DEV='$BOOT_DEV'"
+
+	if [ "$ROOT_DEV" = "" ] ; then
+		ROOT_DEV=$(awk -F root= '{print $2}' </proc/cmdline |
+							awk '{print $1}')
+		_dmr_debug "bootparam_root: missing. guessed: $ROOT_DEV"
+	fi
+
+	if [ "$BOOT_DEV" = "" ] ; then
+		# replace e.g., /dev/mmcblk0p2 with /dev/mmcblk0p1
+		case "$ROOT_DEV" in
+		/dev/mmcblk*p[0-9]*|/dev/nvme*p[0-9]*)
+			BOOT_DEV=$(echo "$ROOT_DEV" | sed 's/p[0-9][0-9]*$/p1/')
+			;;
+		/dev/sd*[0-9])
+			BOOT_DEV=$(echo "$ROOT_DEV" | sed 's/[0-9][0-9]*$/1/')
+			;;
+		*)
+			_dmr_fatal "unsupported disk layout ($ROOT_DEV)"
+			;;
+		esac
+
+
+		_dmr_debug "bootparam_boot: missing. guessed: $BOOT_DEV"
+	fi
+
+	[ "$BOOT_DEV" != "" ] && [ "$BOOT_DEV" != "$ROOT_DEV" ] ||
+		_dmr_fatal "cannot determine boot device from root device ($ROOT_DEV)"
+
+	case "$BOOT_DEV" in
+	/dev/mmcblk*p[0-9]*|/dev/nvme*p[0-9]*)
+		DISK_DEV=$(echo "$BOOT_DEV" | sed 's/p[0-9][0-9]*$//')
+		;;
+	/dev/sd*)
+		DISK_DEV=$(echo "$BOOT_DEV" | sed 's/[0-9]*$//')
+		;;
+	*)
+		_dmr_fatal "unsupported disk layout ($BOOT_DEV)"
+		;;
+	esac
+
+	[ "$DISK_DEV" != "$BOOT_DEV" ] ||
+		_dmr_fatal "cannot determine disk device from boot part. device"
+
+	_dmr_debug "DISK_DEV='$DISK_DEV'"
+
+	# Poll for devices: device initialization is concurrent to the init
+	# process before the 01-udev phase. Because of a systemd daemon is
+	# launched in 01-udev, we need to wait for the devices to show up
+
+	_dmr_debug "Waiting for devices..."
+
+	for dmr_dev in "$BOOT_DEV" "$ROOT_DEV" ; do
+		_dmr_poll_block_device "$dmr_dev"
+	done
+
+	[ -b "$ROOT_DEV" ] || _dmr_fatal "rootfs '$ROOT_DEV' not a block device"
+	[ -b "$BOOT_DEV" ] || _dmr_fatal "bootfs '$BOOT_DEV' not a block device"
+
+	ROOT_DEV_SECTORS=$(blockdev --getsz "$ROOT_DEV" 2>/dev/null) ||
+		_dmr_fatal "cannot read number of sectors of $ROOT_DEV"
+	ROOT_DEV_SECTOR_SIZE=$(blockdev --getss "$ROOT_DEV" 2>/dev/null) ||
+		_dmr_fatal "cannot read sector size of $ROOT_DEV"
+	ROOT_DEV_SECTORS=$((ROOT_DEV_SECTORS + 0))
+	ROOT_DEV_SECTOR_SIZE=$((ROOT_DEV_SECTOR_SIZE + 0))
+	RD_OK=$((ROOT_DEV_SECTORS > 0 && ROOT_DEV_SECTOR_SIZE > 0 ? 1 : 0))
+
+	[ "$RD_OK" = 1 ] ||
+		_dmr_fatal "Wrong device: $ROOT_DEV ($ROOT_DEV_SECTORS sectors, $ROOT_DEV_SECTOR_SIZE sector size)"
+
+	mkdir -p "$BOOT_MNT" &&
+	_dmr_run mount -o rw "$BOOT_DEV" "$BOOT_MNT" ||
+		_dmr_fatal "mount($BOOT_DEV, $BOOT_MNT) failed $DMR_NR_MSG"
+
+	if _dmr_debug_flag ; then
+		_dmr_msg "Debug flag found: extra debug level"
+		bootparam_debug=1 bootparam_verbose=1
+	fi
+}
+
+_dmr_check_and_map()
+{
+	_dmr_debug "_dmr_check_and_map (ctx: $ENC_CTX)"
+
+	_dmr_setup_encryption_backend
+
+	if [ -e "$BOOT_KEY_BLOB" ] ; then
+		# NORMAL ENCRYPTED BOOT: key available
+
+		_dmr_debug "dmcrypt_rootfs: key blob found ($BOOT_KEY_BLOB)"
+
+		_dmr_load_key_$ENC_CTX
+		_dmr_map_setup
+		return
+	fi
+
+	# NO KEY BLOB FOUND: assuming first boot
+
+	_dmr_first_boot_preparation
+}
+
+_dmr_encrypted_boot()
+{
+	_dmr_debug "_dmr_encrypted_boot"
+
+	NR=/newroot
+
+	_dmr_encrypted_boot_prerequisites
+
+	_dmr_cleanup
+	_dmr_run mkdir -p "$NR"
+	_dmr_run mount "$ROOT_MAP_DEV" "$NR"
+	_dmr_run exec switch_root "$NR" /sbin/init
+}
+
+# COMMON BOOT functions (>= 1st boot) --------------------------------------
+
+_dmr_encrypted_boot_prerequisites()
+{
+	# Case for signed OS images with embedded DTBs (e.g., AHAB): if
+	# the OS Image is zImage or Image, it would meain it is a
+	# non-AHAB container:
+
+	if [ "$(echo "$OS_IMAGE" | grep -i image)" = "" ] ; then
+		_dmr_msg "Pre-requisites: OK, signed OS image"
+		return
+	fi
+
+	# Case of signed/unsigned OS image with external DTBs: we
+	# verify them with external signature files:
+
+	SIGNED_FILES=0
+	BOOT_CHECK=$TMPFS/boot_check.txt
+
+	(	ls -1 "$BOOT_MNT/"*dtb 2>/dev/null || true
+		ls -1 "$BOOT_MNT/"*bin 2>/dev/null || true
+	) | grep -v '\.sig$' >"$BOOT_CHECK"
+
+	_dmr_msg "Checking signatures: "$(xargs <"$BOOT_CHECK")" ..."
+
+	while read chki ; do
+		_dmr_verify_file_sig "$chki" "$chki.sig"
+		SIGNED_FILES=$((SIGNED_FILES + 1))
+	done <"$BOOT_CHECK"
+
+	_dmr_msg "Pre-requisites: OK ($SIGNED_FILES signed files verified)"
+}
+
+# FIRST BOOT functions (manufacturing phase) -------------------------------
+
+_dmr_check_enc_begin()
+{
+	_dmr_debug "_dmr_check_enc_begin"
+
+	[ !  -e "$ENC_INCOMPLETE_FLAG" ] ||
+		_dmr_fatal "Previous incomplete operation detected $DMR_NR_MSG"
+
+	_dmr_run touch "$ENC_INCOMPLETE_FLAG" && sync ||
+		_dmr_fatal "Can not set the enc-incomplete flag $DMR_NR_MSG"
+}
+
+_dmr_check_enc_end()
+{
+	_dmr_debug "_dmr_check_enc_end"
+
+	rm -f "$ENC_INCOMPLETE_FLAG" && sync ||
+		_dmr_fatal "Can not clear the enc-incomplete flag $DMR_NR_MSG"
+}
+
+_dmr_first_boot_manufacturing_cleanup()
+{
+	BOOT_DIRS=$TMPFS/boot_dirs.txt
+	BOOT_FILES=$TMPFS/boot_files.txt
+	DELETED_FILES=""
+
+	_dmr_msg "- Checking for non-trusted files..."
+
+	# Delete all files not having a .sig companion file, except for the
+	# case of the OS image, which is already signed internally
+
+	find "$BOOT_MNT" -type f |
+		grep -v "$OS_IMAGE" |
+		grep -v "$KEY_BLOB_FN" |
+		grep -v "\.sig\$" >"$BOOT_FILES"
+	find "$BOOT_MNT" -type d >"$BOOT_DIRS"
+
+	while read f_i ; do
+		[ ! -e "$f_i.sig" ] || continue
+		_dmr_run rm -f "$f_i"
+		DELETED_FILES="$DELETED_FILES $f_i"
+	done <"$BOOT_FILES"
+
+	[ "$DELETED_FILES" != "" ] || DELETED_FILES="(none)"
+
+	_dmr_msg "  Files without .sig counterpart, deleted: $DELETED_FILES"
+	_dmr_msg "- Checking for empty directories..."
+
+	while read d_i ; do
+		_dmr_empty_dir "$d_i" || continue
+		_dmr_msg "Directory '$d_i' empty: deleting it..."
+		_dmr_run rmdir "$d_i"
+	done <"$BOOT_DIRS"
+
+	_dmr_msg "- Removing manufacturing-related files..."
+
+	for f_i in "$FACTORY_ROOTFS_SHA256_FILE" \
+			"$FACTORY_ROOTFS_SHA256_SIG_FILE" ; do
+		_dmr_run rm -f "$f_i"
+	done
+}
+
+_dmr_first_boot_manufacturing_info()
+{
+	BKB_B64=$(base64 -w0 <"$BOOT_KEY_BLOB")
+	BKB_SHA256=$(sha256sum <"$BOOT_KEY_BLOB" | cut -d ' ' -f1)
+	SOC_ID_F=/sys/bus/soc/devices/soc0/soc_id
+	SOC_SN_F=/sys/bus/soc/devices/soc0/serial_number
+
+	[ -e "$SOC_SN_F" ] || SOC_SN_F=/sys/devices/soc0/serial_number
+	[ ! -e "$SOC_SN_F" ] || SOC_SN=$(cat <"$SOC_SN_F")
+	[ ! -e "$SOC_ID_F" ] || SOC_ID=$(cat <"$SOC_ID_F")
+
+	M_SOC=$(echo "SoC(SN ID)=[$SOC_SN $SOC_ID]")
+	M_TK=$(echo "TK(b64 sha256)=[$BKB_B64 $BKB_SHA256]")
+
+	_dmr_msg "- SoC SN and TK (per-board, printed 3 times):"
+
+	# Duplicate the message 3 times. Rationale: avoid the risk
+	# of log being cut by spurious kernel messages, so the
+	# automation scrapping the serial port output detects it:
+
+	for i in 1 2 3 ; do _dmr_msg "  $M_SOC - $M_TK" ; done
+}
+
+_dmr_first_boot_manufacturing_final_step()
+{
+	_dmr_debug "_dmr_first_boot_manufacturing_final_step"
+
+	_dmr_banner ".-~-. First boot: manufacturing final step .-~-."
+
+	_dmr_first_boot_manufacturing_cleanup
+	_dmr_first_boot_manufacturing_info
+
+	_dmr_encrypted_boot_prerequisites
+
+	_dmr_banner "++ SUCCESS: BOARD VALIDATED in $(_dmr_elapsed) seconds ++"
+
+	# Observation: not doing the 'poweroff' the board would
+	# continue booting with the encrypted rootfs. I.e., the
+	# reason for the poweroff is to keep the rootfs content
+	# intact from factory, so e.g., the customer when powering
+	# the board in Production will have the guarantee of
+	# determinism in the content. Being the only difference
+	# between two boards the content of the content of the
+	# trusted keys, being those unique per board, by design.
+
+	_dmr_msg "Powering off the system ..."
+
+	_dmr_poweroff
+}
+
+_dmr_first_boot_preparation()
+{
+	_dmr_banner "++++++++ FIRST BOOT: DO NOT POWER OFF THE BOARD ++++++++"
+
+	_dmr_msg "(no key blob found: assuming first boot (factory))"
+
+	DMR_NR_MSG=$DMR_NR_FACTORY
+
+	# Possible first boot detected: we need to differentiate between
+	# an actual first boot and the encryption key being missing
+
+	UNENCRYPTED=$(blkid "$ROOT_DEV" | grep "$FS_TYPE" | wc -l)
+
+	[ "$UNENCRYPTED" = 1 ] ||
+		_dmr_fatal "Encrypted rootfs and missing key blob $DMR_NR_MSG"
+
+	# First boot: create per-device CAAM random key + encrypt fs
+
+	_dmr_check_enc_begin
+	_dmr_create_key
+	_dmr_load_key_$ENC_CTX
+	_dmr_map_setup
+	_dmr_encrypt
+	_dmr_check_enc_end
+	_dmr_first_boot_manufacturing_final_step
+}
+
+_dmr_digest_rootfs()
+{
+	_dmr_run dd if=$1 bs=$DD_BS status=progress | sha256sum | cut -d ' ' -f1
+}
+
+_dmr_verify_file_sig()
+{
+	 _dmr_debug "_dmr_verify_file_sig"
+
+	[ -e "$FACTORY_PUB_KEY_FILE" ] ||
+		_dmr_fatal "Missing: $FACTORY_PUB_KEY_FILE $DMR_NR_MSG"
+
+	[ -e "$2" ] ||
+		_dmr_fatal "signature($1 $2): '$2' is missing $DMR_NR_MSG"
+
+	_dmr_run command -v openssl >/dev/null ||
+		_dmr_fatal "Missing: openssl $DMR_NR_MSG"
+
+	_dmr_run openssl dgst -sha256 -verify "$FACTORY_PUB_KEY_FILE" \
+				-signature "$2" "$1" ||
+		_dmr_fatal "signature($1 $2): FAILED $DMR_NR_MSG"
+
+	_dmr_msg "OK: signature($1, $2)"
+}
+
+_dmr_encrypt()
+{
+	_dmr_debug "_dmr_encrypt"
+
+	if _dmr_debug_flag ; then
+		# This is not actually needed, kept for allowing
+		# checking defective recording on manufacturing
+
+		_dmr_msg "Hashing original partition ($ROOT_DEV)..."
+		ROOT_DEV_SHA256=$(_dmr_digest_rootfs $ROOT_DEV)
+		_dmr_msg "SHA256($ROOT_DEV)=$ROOT_DEV_SHA256"
+	fi
+
+	FACTORY_ROOTFS_SHA256=$(cut -d ' ' -f1 < "$FACTORY_ROOTFS_SHA256_FILE")
+
+	_dmr_verify_file_sig \
+		"$FACTORY_ROOTFS_SHA256_FILE" \
+		"$FACTORY_ROOTFS_SHA256_SIG_FILE"
+
+	_dmr_banner "In-place encryption $ROOT_DEV -> $ROOT_MAP_DEV ..."
+
+	_dmr_run dd if=$ROOT_DEV of=$ROOT_MAP_DEV \
+			bs=$DD_BS \
+			iflag=fullblock,direct oflag=direct conv=notrunc \
+			status=progress ||
+		_dmr_fatal "rootfs encryption failed $DMR_NR_MSG"
+
+
+	_dmr_run blockdev --flushbufs "$ROOT_DEV" || true
+
+	_dmr_banner "Validating mapped partition content ($ROOT_MAP_DEV) ..."
+
+	ROOT_MAP_DEV_SHA256=$(_dmr_digest_rootfs $ROOT_MAP_DEV)
+
+	_dmr_msg "SHA256(factory rootfs)=$FACTORY_ROOTFS_SHA256"
+	_dmr_msg "SHA256($ROOT_MAP_DEV)=$ROOT_MAP_DEV_SHA256"
+
+	[ "$FACTORY_ROOTFS_SHA256" = "$ROOT_MAP_DEV_SHA256" ] ||
+		_dmr_fatal "rootfs integrity check failed $DMR_NR_MSG"
+
+	_dmr_banner "Integrity check OK: encrypted rootfs matches the original"
+}
+
+# Backend, common ----------------------------------------------------------
+
+_dmr_sec_error()
+{
+	_dmr_fatal "Backend not set (CAAM nor TK) $DMR_NR_MSG"
+}
+
+_dmr_create_key_() { _dmr_sec_error ; }
+_dmr_load_key_() { _dmr_sec_error ; }
+_dmr_map_setup_conf_() { _dmr_sec_error ; }
+_dmr_setup_encryption_backend_() { _dmr_sec_error ; }
+
+# We use two sectors in the pre-partition space for storing:
+# - The HW-protected encryption key, in base64. Note that the key is always
+#   protected, as it is encrypted with an unique key stored inside
+#   each SoC. The rationale for keeping a copy is for the use case of
+#   accidental removal of the protected key from the boot partition
+# - SHA-256 digest of the factory public key as 'magic number',
+#   for 'the protected key was stored'.
+_dmr_save_key_blob_to_prepart()
+{
+	BOOT_KEY_BLOB_B64=$TMPFS/bkb.b64
+	FPKF_SHA256_FILE=$TMPFS/factory.pub.pem.sha256
+
+	_dmr_run base64 -w0 "$BOOT_KEY_BLOB" >"$BOOT_KEY_BLOB_B64"
+
+	for i in /dev/zero "$BOOT_KEY_BLOB_B64" ; do
+		_dmr_run dd if="$i" of=$DISK_DEV bs=512 seek=$PREPART_512B_S1 \
+				count=1 conv=notrunc >/dev/null 2>&1 ||
+			_dmr_fatal "I/O error [2] $DMR_NR_MSG"
+	done
+
+	_dmr_run sha256sum "$FACTORY_PUB_KEY_FILE" | cut -d ' ' -f1 \
+						>"$FPKF_SHA256_FILE"
+
+	for i in /dev/zero "$FPKF_SHA256_FILE" ; do
+		_dmr_run dd if="$i" of=$DISK_DEV bs=512 seek=$PREPART_512B_S0 \
+				count=1 conv=notrunc >/dev/null 2>&1 ||
+			_dmr_fatal "I/O error [1] $DMR_NR_MSG"
+	done
+
+	_dmr_msg "Pre-part storage sectors: $PREPART_512B_S0 $PREPART_512B_S1"
+}
+
+_dmr_restore_key_blob_from_prepart()
+{
+	FPKF_SHA256_FILE=$TMPFS/factory.pub.pem.sha256
+	FPKF_SHA256_FILE_BCK=$FPKF_SHA256_FILE.bck
+	BOOT_KEY_BLOB_B64=$TMPFS/bkb.b64
+	BOOT_KEY_BLOB_BCK=$TMPFS/bkb.bck
+
+	# Retrieve the 'key is stored' magic number (SHA-256 of the pub key)
+
+	_dmr_run dd if=$DISK_DEV \
+		bs=512 skip=$PREPART_512B_S0 \
+			count=1 2>/dev/null | tr -d '\000' \
+						>"$FPKF_SHA256_FILE_BCK"
+	_dmr_run sha256sum "$FACTORY_PUB_KEY_FILE" | cut -d ' ' -f1 \
+						>"$FPKF_SHA256_FILE"
+
+	# Retrieve the protectec key backup
+
+	_dmr_run dd if=$DISK_DEV \
+		bs=512 skip=$PREPART_512B_S1 \
+			count=1 2>/dev/null | tr -d '\000' \
+						>"$BOOT_KEY_BLOB_B64"
+	_dmr_run base64 -d "$BOOT_KEY_BLOB_B64" >"$BOOT_KEY_BLOB_BCK"
+
+	# Check if the magic number and protected key backup is present
+
+	if ! _dmr_run cmp "$FPKF_SHA256_FILE" "$FPKF_SHA256_FILE_BCK" \
+							>/dev/null 2>&1 ||
+	   [ "$(wc -c < "$BOOT_KEY_BLOB_BCK")" = 0 ] ; then
+		_dmr_msg "No key data found in the pre-part storage"
+		return 0
+	fi
+
+	if [ ! -e "$BOOT_KEY_BLOB" ] ||
+	   ! _dmr_run cmp "$BOOT_KEY_BLOB" "$BOOT_KEY_BLOB_BCK" ; then
+		_dmr_msg "Restoring boot key restored to $BOOT_KEY_BLOB"
+		mv -f "$BOOT_KEY_BLOB_BCK" "$BOOT_KEY_BLOB"
+		return 0
+	fi
+}
+
+_dmr_setup_encryption_backend()
+{
+	_dmr_setup_encryption_backend_$ENC_CTX
+	BOOT_KEY_BLOB=$BOOT_MNT/$KEY_BLOB_FN
+
+	_dmr_restore_key_blob_from_prepart
+}
+
+_dmr_create_key()
+{
+	_dmr_create_key_$ENC_CTX
+
+	_dmr_save_key_blob_to_prepart
+}
+
+# $1: cipher e.g. "capi:tk(cbc(aes))-plain64"
+# $2: key e.g. ":36:logon:logkey:"
+_dmr_table_gen()
+{
+	tgen="0 $ROOT_DEV_SECTORS crypt $1 $2 0 $ROOT_DEV 0"
+
+	[ "$DM_TABLE_SECTOR_SIZE" = 512 ] ||
+		tgen="$tgen 2 sector_size:$DM_TABLE_SECTOR_SIZE iv_large_sectors"
+
+	echo "$tgen"
+}
+
+_dmr_map_setup()
+{
+	_dmr_debug "_dmr_map_setup"
+
+	_dmr_map_setup_conf_$ENC_CTX
+
+	_dmr_run dmsetup create "$KEY_ID" --table "$ROOT_DEV_DM_TABLE" ||
+		_dmr_fatal "dmsetup create failed"
+
+	_dmr_run dmsetup table --showkey "$KEY_ID"
+	_dmr_run dmsetup mknodes "$KEY_ID"
+}
+
+# Backend, CAAM ------------------------------------------------------------
+
+# Reference: NXP AN12714 (i.MX Encrypted Storage Using CAAM Secure Keys)
+
+_dmr_setup_encryption_backend_caam()
+{
+	# CAAM: black key blob (.bb)
+	CAAM_DATA_PATH=/data/caam
+	BLACK_KEY_CAAM_PATH=$CAAM_DATA_PATH/$KEY_ID
+	BLACK_KEY_BLOB_CAAM_PATH=$BLACK_KEY_CAAM_PATH.bb
+	KEY_BLOB_FN=$KEY_ID.bb
+}
+
+_dmr_create_key_caam()
+{
+	_dmr_debug "_dmr_create_key_caam"
+
+	_dmr_run caam-keygen create "$KEY_ID" ccm -s $KEY_RAW_SIZE ||
+		_dmr_fatal "CAAM key '$KEY_ID' generation error $DMR_NR_MSG"
+
+	_dmr_run cp "$BLACK_KEY_BLOB_CAAM_PATH" "$BOOT_KEY_BLOB" ||
+		_dmr_fatal "can't copy '$BLACK_KEY_BLOB_CAAM_PATH' to '$BOOT_KEY_BLOB' $DMR_NR_MSG"
+}
+
+_dmr_load_key_caam()
+{
+	_dmr_debug "_dmr_load_key_caam"
+
+	_dmr_run caam-keygen import "$BOOT_KEY_BLOB" "$KEY_ID" ||
+		_dmr_fatal "can't import '$KEY_ID' from '$BOOT_KEY_BLOB'"
+
+	_dmr_run keyctl padd logon $KEY_ID: $DMR_KRM \
+					< "$BLACK_KEY_CAAM_PATH" >/dev/null ||
+		_dmr_fatal "keyctl padd logon failed"
+}
+
+_dmr_map_setup_conf_caam()
+{
+	_dmr_debug "_dmr_map_setup_conf_caam"
+
+	cipher_cfg="capi:tk(cbc(aes))-plain64"
+
+	blob_key_size=$(wc -c < "$BLACK_KEY_CAAM_PATH" | tr -d ' ')
+	key_cfg=":$blob_key_size:logon:$KEY_ID:"
+
+	ROOT_DEV_DM_TABLE=$(_dmr_table_gen "$CAAM_CIPHER" "$key_cfg")
+}
+
+# Backend, TK --------------------------------------------------------------
+
+# Reference: NXP UG10163 (i.MX Linux User's Guide)
+
+_dmr_setup_encryption_backend_tk()
+{
+	KEY_BLOB_FN=$KEY_ID.tk
+
+	case "$TK_BACKEND" in
+	paes)	KEYCTL_ADD_ALGO=" pk key_enc_algo=1"
+		TK_CIPHER=$PAES_CIPHER
+		;;
+	ele-tee)
+		KEYCTL_ADD_ALGO=""
+		TK_CIPHER=$ELE_TEE_CIPHER
+		;;
+	*)	_dmr_fatal "TK backend not supported: $TK_BACKEND $DMR_NR_MSG"
+	esac
+}
+
+_dmr_create_key_tk()
+{
+	_dmr_debug "_dmr_create_key_tk (TK backend: $TK_BACKEND)"
+
+	keyid=$(_dmr_run keyctl add trusted "$KEY_ID" \
+		"new $KEY_RAW_SIZE$KEYCTL_ADD_ALGO" $DMR_KRM) ||
+		_dmr_fatal "trusted key '$KEY_ID' generation error $DMR_NR_MSG"
+
+	_dmr_run keyctl pipe "$keyid" > "$BOOT_KEY_BLOB" ||
+		_dmr_fatal "can't save trusted key blob to $BOOT_KEY_BLOB $DMR_NR_MSG"
+
+	# Unload the key, as after this the first boot workflow will
+	# load the protected key it from disk, so we ensure the next
+	# boot will work too:
+
+	_dmr_run keyctl unlink "$keyid" @u
+}
+
+_dmr_load_key_tk()
+{
+	_dmr_debug "_dmr_load_key_tk"
+
+	BOOT_KEY_BLOB_DATA=$(_dmr_run cat "$BOOT_KEY_BLOB")
+
+	_dmr_run keyctl add trusted "$KEY_ID" \
+		"load $BOOT_KEY_BLOB_DATA$KEYCTL_ADD_ALGO" $DMR_KRM \
+								>/dev/null ||
+		_dmr_fatal "can't load key from '$BOOT_KEY_BLOB' $DMR_NR_MSG"
+}
+
+_dmr_map_setup_conf_tk()
+{
+	_dmr_debug "_dmr_map_setup_conf_tk"
+
+	dmc_key_size=$KEY_RAW_SIZE
+	[ "$TK_BACKEND" != paes ] ||
+		dmc_key_size=$((($(wc -c <"$BOOT_KEY_BLOB") / 2) + 4))
+
+	key_cfg=":$dmc_key_size:trusted:$KEY_ID"
+	ROOT_DEV_DM_TABLE=$(_dmr_table_gen "$TK_CIPHER" "$key_cfg")
+}

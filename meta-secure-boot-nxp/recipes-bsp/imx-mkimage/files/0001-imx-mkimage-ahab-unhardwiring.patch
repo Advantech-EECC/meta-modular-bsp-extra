@@ -1,0 +1,136 @@
+Observation: ad hoc patch
+
+With this patch we add support for kernel DTB address unhardwiring for
+the case of AHAB SoCs with hardwired values in their soc.mak (imx-mkimage):
+
+	iMX8DXL/soc.mak
+	iMX8QM/soc.mak
+	iMX8QX/soc.mak
+	iMX8ULP/soc.mak
+
+Note that e.g. iMX91, 93, 94, 95 were already unhardwired. This change
+follows existing constant propagation flow.
+
+This is required for the following cases:
+
+- Secure Boot builds requiring DTB name unhardwiring
+- Secure Boot builds using 'initramfs' bigger than the default space,
+  involving the need of moving the 'fdt_address' after the OS image
+
+Upstream-Status: Inappropriate [other]
+Signed-off-by: F. Aragon <francisco.aragon@advantech.de>
+
+diff --git a/iMX8DXL/soc.mak b/iMX8DXL/soc.mak
+index ec6f467..8fce8be 100755
+--- a/iMX8DXL/soc.mak
++++ b/iMX8DXL/soc.mak
+@@ -31,6 +31,9 @@ endif
+ 
+ TEE_LOAD_ADDR ?= 0x96000000
+ 
++KERNEL_DTB ?= imx8dxl-evk.dtb
++KERNEL_DTB_ADDR ?= 0x83000000
++
+ FORCE:
+ 
+ u-boot-hash.bin: u-boot.bin
+@@ -154,8 +157,8 @@ flash_scfw: $(MKIMG) $(SECO_FW_NAME) scfw_tcm.bin
+ flash_patch: $(MKIMG) $(SECO_FW_NAME) scfw_tcm.bin message_signed.bin
+ 	./$(MKIMG) -soc DXL -rev A0 -append $(SECO_FW_NAME) -c -scfw scfw_tcm.bin -msg_blk message_signed.bin patch 0x80000000 $(V2X_DUMMY_OCRAM) --out flash.bin
+ 
+-flash_kernel: $(MKIMG) Image imx8dxl-evk.dtb
+-	./$(MKIMG) -soc DXL -rev A0 -h sha256 -c -ap Image a35 0x80200000 --data imx8dxl-evk.dtb a35 0x83000000 -out flash.bin
++flash_kernel: $(MKIMG) Image $(KERNEL_DTB)
++	./$(MKIMG) -soc DXL -rev A0 -h sha256 -c -ap Image a35 0x80200000 --data $(KERNEL_DTB) a35 $(KERNEL_DTB_ADDR) -out flash.bin
+ 
+ parse_container: $(MKIMG) flash.bin
+ 	./$(MKIMG) -soc DXL -rev A0 -parse flash.bin
+diff --git a/iMX8QM/soc.mak b/iMX8QM/soc.mak
+index 885f7b9..3ec27e1 100755
+--- a/iMX8QM/soc.mak
++++ b/iMX8QM/soc.mak
+@@ -17,6 +17,9 @@ PAD_IMAGE = ../scripts/pad_image.sh
+ AHAB_IMG = mx8qmb0-ahab-container.img
+ TEE = tee.bin
+ 
++KERNEL_DTB ?= imx8qm-mek.dtb
++KERNEL_DTB_ADDR ?= 0x83000000
++
+ FORCE:
+ 
+ u-boot-hash.bin: u-boot.bin
+@@ -185,8 +188,8 @@ flash_regression_linux_m41_xip: $(MKIMG) $(AHAB_IMG) scfw_tcm.bin u-boot-atf.bin
+ flash_scfw: $(MKIMG) $(AHAB_IMG) scfw_tcm.bin
+ 	./$(MKIMG) -soc QM -rev B0 -dcd skip -append $(AHAB_IMG) -c -scfw scfw_tcm.bin -out flash.bin
+ 
+-flash_kernel: $(MKIMG) Image imx8qm-mek.dtb
+-	./$(MKIMG) -soc QM -rev B0 -c -ap Image a53 0x80200000 --data imx8qm-mek.dtb a53 0x83000000 -out flash.bin
++flash_kernel: $(MKIMG) Image $(KERNEL_DTB)
++	./$(MKIMG) -soc QM -rev B0 -c -ap Image a53 0x80200000 --data $(KERNEL_DTB) a53 $(KERNEL_DTB_ADDR) -out flash.bin
+ 
+ flash_ca72: $(MKIMG) $(AHAB_IMG) scfw_tcm.bin u-boot-atf.bin
+ 	./$(MKIMG) -soc QM -rev B0 -append $(AHAB_IMG) -c -scfw scfw_tcm.bin -ap u-boot-atf.bin a72 0x80000000 -out flash.bin
+diff --git a/iMX8QX/soc.mak b/iMX8QX/soc.mak
+index 4817f32..fc8d495 100755
+--- a/iMX8QX/soc.mak
++++ b/iMX8QX/soc.mak
+@@ -30,6 +30,9 @@ else ifeq ($(SOC),iMX8QX)
+ TEE_LOAD_ADDR ?=  0xFE000000
+ endif
+ 
++KERNEL_DTB ?= imx8qxp-mek.dtb
++KERNEL_DTB_ADDR ?= 0x83000000
++
+ FORCE:
+ 
+ u-boot-hash.bin: u-boot.bin
+@@ -145,8 +148,8 @@ flash_regression_linux_m4_xip : $(MKIMG) $(AHAB_IMG) scfw_tcm.bin u-boot-atf.bin
+ flash_scfw: $(MKIMG) $(AHAB_IMG) scfw_tcm.bin
+ 	./$(MKIMG) -soc QX -rev B0 -dcd skip -append $(AHAB_IMG) -c -scfw scfw_tcm.bin -out flash.bin
+ 
+-flash_kernel: $(MKIMG) Image imx8qxp-mek.dtb
+-	./$(MKIMG) -soc QX -rev B0 -c -ap Image a35 0x80200000 --data imx8qxp-mek.dtb a35 0x83000000 -out flash.bin
++flash_kernel: $(MKIMG) Image $(KERNEL_DTB)
++	./$(MKIMG) -soc QX -rev B0 -c -ap Image a35 0x80200000 --data $(KERNEL_DTB) a35 $(KERNEL_DTB_ADDR) -out flash.bin
+ 
+ parse_container: $(MKIMG) flash.bin
+ 	./$(MKIMG) -soc QX -rev B0 -parse flash.bin
+diff --git a/iMX8ULP/soc.mak b/iMX8ULP/soc.mak
+index dd61cd7..0e45594 100644
+--- a/iMX8ULP/soc.mak
++++ b/iMX8ULP/soc.mak
+@@ -25,6 +25,9 @@ UPOWER_IMG = upower.bin
+ MCU_IMG = m33_image.bin
+ ROM_PATCH_IMG = ahab-container-patch.bin
+ 
++KERNEL_DTB ?= imx8ulp-evk.dtb
++KERNEL_DTB_ADDR ?= 0x83000000
++
+ SPL_LOAD_ADDR ?= 0x22020000
+ ATF_LOAD_ADDR ?= 0x20040000
+ TEE_LOAD_ADDR ?= 0xa6000000
+@@ -33,7 +36,6 @@ MCU_SSRAM_ADDR ?= 0x1ffc2000
+ MCU_XIP_ADDR ?= 0x4032000 # Point entry of m33 in flexspi0 nor flash
+ M33_IMAGE_XIP_OFFSET ?= 0x31000 # 1st container offset is 0x1000 when boot device is flexspi0 nor flash, actually the m33_image.bin is in 0x31000 + 0x1000 = 0x32000.
+ 
+-
+ FORCE:
+ 
+ u-boot-hash.bin: u-boot.bin
+@@ -152,12 +154,12 @@ ifeq ($(REV),A0)
+ prepare_kernel_chunks: Image
+ 	./$(SPLIT_KERNEL) Image 0x80400000 0x700000
+ 
+-flash_kernel: $(MKIMG) prepare_kernel_chunks imx8ulp-evk.dtb
++flash_kernel: $(MKIMG) prepare_kernel_chunks $(KERNEL_DTB)
+ 	KERNEL_CMD="$(shell cat Image_cmd)"; \
+-	./$(MKIMG) -soc ULP -c $$KERNEL_CMD --data imx8ulp-evk.dtb a35 0x83000000 -out flash.bin
++	./$(MKIMG) -soc ULP -c $$KERNEL_CMD --data $(KERNEL_DTB) a35 $(KERNEL_DTB_ADDR) -out flash.bin
+ else
+-flash_kernel: $(MKIMG) Image imx8ulp-evk.dtb
+-	./$(MKIMG) -soc ULP -c -ap Image a35 0x80400000 --data imx8ulp-evk.dtb a35 0x83000000 -out flash.bin
++flash_kernel: $(MKIMG) Image $(KERNEL_DTB)
++	./$(MKIMG) -soc ULP -c -ap Image a35 0x80400000 --data $(KERNEL_DTB) a35 $(KERNEL_DTB_ADDR) -out flash.bin
+ endif
+ 
+ parse_container: $(MKIMG) flash.bin
